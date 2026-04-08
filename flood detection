@@ -1,3 +1,510 @@
-###google mount
+// google mount
 from google.colab import drive
 drive.mount('/content/drive')
+
+//Install Required Library
+!pip install segmentation-models-pytorch
+
+//Import Libraries
+import os
+import cv2
+import torch
+import numpy as np
+import segmentation_models_pytorch as smp
+import torch.nn as nn
+
+from torch.utils.data import Dataset, DataLoader
+
+//Connect Dataset Path
+IMAGE_PATH = "/content/drive/MyDrive/FloodNet Challenge @ EARTHVISION 2021 - Track 1/Train/Labeled/Flooded/image"
+
+MASK_PATH  = "/content/drive/MyDrive/FloodNet Challenge @ EARTHVISION 2021 - Track 1/Train/Labeled/Flooded/mask"
+
+
+//Create Dataset Class
+
+class FloodDataset(Dataset):
+
+    def __init__(self, image_dir, mask_dir):
+
+        self.image_dir = image_dir
+        self.mask_dir = mask_dir
+
+        self.images = os.listdir(image_dir)
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+
+        img_name = self.images[idx]
+
+        img_path = os.path.join(self.image_dir, img_name)
+
+        base = img_name.split(".")[0]
+        mask_name = base + "_lab.png"
+
+        mask_path = os.path.join(self.mask_dir, mask_name)
+
+        image = cv2.imread(img_path)
+        mask  = cv2.imread(mask_path,0)
+
+        image = cv2.resize(image,(128,128))
+        mask  = cv2.resize(mask,(128,128), interpolation=cv2.INTER_NEAREST)
+
+        image = image / 255.0
+
+        mask = np.where(mask==5,1.0,0.0)
+
+        image = torch.tensor(image).permute(2,0,1).float()
+        mask  = torch.tensor(mask).unsqueeze(0).float()
+
+        return image, mask
+
+//create Dataset
+dataset = FloodDataset(IMAGE_PATH, MASK_PATH)
+
+print("Dataset size:",len(dataset))
+
+//Data loader
+train_loader = DataLoader(dataset, batch_size=4, shuffle=True)
+
+//Initialize U-Net Model
+model = smp.Unet(
+    encoder_name="resnet34",
+    encoder_weights="imagenet",
+    in_channels=3,
+    classes=1
+)
+
+//GPU Setup
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+model = model.to(device)
+
+//Optimizer
+optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
+
+//Train U-Net
+epochs = 40
+
+for epoch in range(epochs):
+
+    total_loss = 0
+
+    for images, masks in train_loader:
+
+        images = images.to(device)
+        masks  = masks.to(device)
+
+        outputs = model(images)
+
+        loss = loss_fn(outputs, masks)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    print("Epoch:",epoch,"Loss:",total_loss)
+
+//Add Evaluation Cell
+def dice_score(pred,target):
+
+    pred = torch.sigmoid(pred)
+    pred = (pred>0.5).float()
+
+    intersection = (pred*target).sum()
+
+    return (2*intersection)/(pred.sum()+target.sum()+1e-8)
+
+
+def iou_score(pred,target):
+
+    pred = torch.sigmoid(pred)
+    pred = (pred>0.5).float()
+
+    intersection = (pred*target).sum()
+
+    union = pred.sum()+target.sum()-intersection
+
+    return intersection/(union+1e-8)
+
+//Compute IoU and Dice
+model.eval()
+
+dice_total = 0
+iou_total = 0
+count = 0
+
+with torch.no_grad():
+
+    for images, masks in train_loader:
+
+        images = images.to(device)
+        masks  = masks.to(device)
+
+        outputs = model(images)
+
+        dice_total += dice_score(outputs,masks)
+        iou_total  += iou_score(outputs,masks)
+
+        count += 1
+
+print("Dice Score:",(dice_total/count).item())
+print("IoU Score:",(iou_total/count).item())
+
+//Initialize DeepLabV3+ Model
+deeplab_model = smp.DeepLabV3Plus(
+    encoder_name="resnet34",
+    encoder_weights="imagenet",
+    in_channels=3,
+    classes=1
+)
+
+deeplab_model = deeplab_model.to(device)
+
+//Loss Function (same as before)
+dice_loss = smp.losses.DiceLoss(mode="binary")
+
+bce_loss = nn.BCEWithLogitsLoss()
+
+def loss_fn(pred,target):
+    return dice_loss(pred,target) + bce_loss(pred,target)
+
+//Optimizer
+optimizer = torch.optim.Adam(deeplab_model.parameters(), lr=0.0001)
+
+//Train DeepLabv3+ model
+epochs = 40
+
+for epoch in range(epochs):
+
+    total_loss = 0
+
+    for images, masks in train_loader:
+
+        images = images.to(device)
+        masks  = masks.to(device)
+
+        outputs = deeplab_model(images)
+
+        loss = loss_fn(outputs, masks)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    print("Epoch:",epoch,"Loss:",total_loss)
+
+//Evaluate DeepLabV3+ moel
+deeplab_model.eval()
+
+dice_total = 0
+iou_total = 0
+count = 0
+
+with torch.no_grad():
+
+    for images, masks in train_loader:
+
+        images = images.to(device)
+        masks = masks.to(device)
+
+        outputs = deeplab_model(images)
+
+        dice_total += dice_score(outputs,masks)
+        iou_total  += iou_score(outputs,masks)
+
+        count += 1
+
+print("DeepLab Dice:",(dice_total/count).item())
+print("DeepLab IoU:",(iou_total/count).item())
+
+//Flood Mask Prediction Code
+import matplotlib.pyplot as plt
+
+model.eval()
+
+# choose a sample image
+img, mask = dataset[5]
+
+img_input = img.unsqueeze(0).to(device)
+
+with torch.no_grad():
+    pred = model(img_input)
+
+pred = torch.sigmoid(pred)
+pred = (pred > 0.5).float()
+
+pred = pred.cpu().squeeze().numpy()
+
+img = img.permute(1,2,0).numpy()
+mask = mask.squeeze().numpy()
+
+plt.figure(figsize=(12,4))
+
+plt.subplot(1,3,1)
+plt.title("Input Image")
+plt.imshow(img)
+plt.axis("off")
+
+plt.subplot(1,3,2)
+plt.title("Ground Truth")
+plt.imshow(mask, cmap="gray")
+plt.axis("off")
+
+plt.subplot(1,3,3)
+plt.title("Prediction")
+plt.imshow(pred, cmap="gray")
+plt.axis("off")
+
+plt.show()
+
+//Initialize Attention U-Net
+attention_model = smp.Unet(
+    encoder_name="resnet34",
+    encoder_weights="imagenet",
+    in_channels=3,
+    classes=1,
+    decoder_attention_type="scse"
+)
+
+attention_model = attention_model.to(device)
+
+//Optimizer
+optimizer = torch.optim.Adam(attention_model.parameters(), lr=0.0001)
+
+//Train Attention U-Net model
+epochs = 50
+
+for epoch in range(epochs):
+
+    total_loss = 0
+
+    for images, masks in train_loader:
+
+        images = images.to(device)
+        masks  = masks.to(device)
+
+        outputs = attention_model(images)
+
+        loss = loss_fn(outputs, masks)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    print("Epoch:",epoch,"Loss:",total_loss)
+
+//Evaluate Attention U-Net model
+attention_model.eval()
+
+dice_total = 0
+iou_total = 0
+count = 0
+
+with torch.no_grad():
+
+    for images, masks in train_loader:
+
+        images = images.to(device)
+        masks = masks.to(device)
+
+        outputs = attention_model(images)
+
+        dice_total += dice_score(outputs,masks)
+        iou_total  += iou_score(outputs,masks)
+
+        count += 1
+
+print("Attention U-Net Dice:",(dice_total/count).item())
+print("Attention U-Net IoU:",(iou_total/count).item())
+
+//Multi-Scale (ASPP) Module
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class ASPP(nn.Module):
+
+    def __init__(self, in_channels, out_channels):
+
+        super(ASPP,self).__init__()
+
+        self.conv1 = nn.Conv2d(in_channels,out_channels,1)
+        self.conv2 = nn.Conv2d(in_channels,out_channels,3,padding=6,dilation=6)
+        self.conv3 = nn.Conv2d(in_channels,out_channels,3,padding=12,dilation=12)
+        self.conv4 = nn.Conv2d(in_channels,out_channels,3,padding=18,dilation=18)
+
+        self.project = nn.Conv2d(out_channels*4,out_channels,1)
+
+    def forward(self,x):
+
+        x1 = self.conv1(x)
+        x2 = self.conv2(x)
+        x3 = self.conv3(x)
+        x4 = self.conv4(x)
+
+        x = torch.cat([x1,x2,x3,x4],dim=1)
+
+        return self.project(x)
+
+//Multi-Scale U-Net (ResNet Encoder)
+import segmentation_models_pytorch as smp
+
+class MultiScaleUNet(nn.Module):
+
+    def __init__(self):
+
+        super(MultiScaleUNet,self).__init__()
+
+        self.unet = smp.Unet(
+            encoder_name="resnet34",
+            encoder_weights="imagenet",
+            in_channels=3,
+            classes=1
+        )
+
+        self.aspp = ASPP(1,1)
+
+    def forward(self,x):
+
+        x = self.unet(x)
+
+        x = self.aspp(x)
+
+        return x
+
+//Initialize Model
+multi_model = MultiScaleUNet().to(device)
+
+//optimizer
+optimizer = torch.optim.Adam(multi_model.parameters(),lr=0.0001)
+
+//Train Multi-Scale model
+epochs = 50
+
+for epoch in range(epochs):
+
+    total_loss = 0
+
+    for images,masks in train_loader:
+
+        images = images.to(device)
+        masks = masks.to(device)
+
+        outputs = multi_model(images)
+
+        loss = loss_fn(outputs,masks)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    print("Epoch:",epoch,"Loss:",total_loss)
+
+//Evaluate Multi-scale model
+multi_model.eval()
+
+dice_total = 0
+iou_total = 0
+count = 0
+
+with torch.no_grad():
+
+    for images,masks in train_loader:
+
+        images = images.to(device)
+        masks = masks.to(device)
+
+        outputs = multi_model(images)
+
+        dice_total += dice_score(outputs,masks)
+        iou_total += iou_score(outputs,masks)
+
+        count += 1
+
+print("Multi-Scale Dice:",(dice_total/count).item())
+print("Multi-Scale IoU:",(iou_total/count).item())
+
+//Sample Test Prediction Code
+import matplotlib.pyplot as plt
+
+multi_model.eval()
+
+# choose a sample image
+img, mask = dataset[10]
+
+# prepare input
+img_input = img.unsqueeze(0).to(device)
+
+with torch.no_grad():
+    pred = multi_model(img_input)
+
+# convert prediction to binary mask
+pred = torch.sigmoid(pred)
+pred = (pred > 0.5).float()
+
+# convert tensors to numpy
+pred = pred.cpu().squeeze().numpy()
+img = img.permute(1,2,0).numpy()
+mask = mask.squeeze().numpy()
+
+plt.figure(figsize=(12,4))
+
+plt.subplot(1,3,1)
+plt.title("Input Image")
+plt.imshow(img)
+plt.axis("off")
+
+plt.subplot(1,3,2)
+plt.title("Ground Truth Flood Mask")
+plt.imshow(mask, cmap="gray")
+plt.axis("off")
+
+plt.subplot(1,3,3)
+plt.title("Predicted Flood Mask")
+plt.imshow(pred, cmap="gray")
+plt.axis("off")
+
+plt.show()
+
+//Multiple Sample Tests
+for i in range(3):
+
+    img, mask = dataset[i]
+
+    img_input = img.unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        pred = multi_model(img_input)
+
+    pred = torch.sigmoid(pred)
+    pred = (pred > 0.5).float().cpu().squeeze().numpy()
+
+    img = img.permute(1,2,0).numpy()
+    mask = mask.squeeze().numpy()
+
+    plt.figure(figsize=(10,3))
+
+    plt.subplot(1,3,1)
+    plt.imshow(img)
+    plt.title("Image")
+
+    plt.subplot(1,3,2)
+    plt.imshow(mask, cmap="gray")
+    plt.title("Ground Truth")
+
+    plt.subplot(1,3,3)
+    plt.imshow(pred, cmap="gray")
+    plt.title("Prediction")
+
+    plt.show()
