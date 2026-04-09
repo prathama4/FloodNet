@@ -509,3 +509,4 @@ for i in range(3):
     plt.title("Prediction")
 
     plt.show()
+//single sample test
